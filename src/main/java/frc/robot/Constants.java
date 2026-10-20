@@ -202,6 +202,45 @@ public final class Constants {
      */
     public static final double shooterSpeed = 0.75;
 
+    /** NEO free speed (RPM). Shooter speeds (0-1) are fractions of this. */
+    public static final double kFreeSpeedRPM = 5676.0;
+
+    /** Flywheel P gain, duty-cycle per RPM of error. Feedforward supplies the bulk of the output. */
+    public static final double kFlywheelP = 0.0001;
+
+    /** Kicker starts feeding once both flywheels are within this fraction of target speed. */
+    public static final double kReadyTolerance = 0.05;
+
+    /** Kicker stops feeding if a flywheel drops beyond this fraction of target (ball dip hysteresis). */
+    public static final double kNotReadyTolerance = 0.12;
+
+    /** If flywheels still aren't at speed after this long, the kicker feeds anyway. */
+    public static final double kMaxSpinUpSeconds = 1.5;
+
+    /**
+     * Safety margin (m) for the ALLIANCE ZONE check (rule G407). We only auto-feed when the
+     * BUMPERS are at least this far inside the zone line, so pose error can't cause a foul.
+     */
+    public static final double kZoneMargin = 0.10;
+
+    /** Auto-shooter only feeds when the robot is pointed within this many degrees of the HUB. */
+    public static final double kAimToleranceDeg = 3.0;
+
+    /**
+     * Which way the shooter points relative to the robot's front, in degrees.
+     * 0 = shooter fires out the front. 180 = out the back. CHECK THIS ON THE ROBOT.
+     */
+    public static final double kShooterHeadingOffsetDeg = 0.0;
+
+    /**
+     * Aim P gain: fraction of max spin speed per radian of heading error.
+     * 2.29/rad equals the old 0.04/degree Limelight tx gain.
+     */
+    public static final double kAimP = 2.29;
+
+    /** Nominal battery voltage that motor outputs are scaled against. */
+    public static final double kNominalVoltage = 12.0;
+
     // --- FRC 2026 REBUILT CONSTANTS ---
 
     /**
@@ -219,6 +258,10 @@ public final class Constants {
 
     /**
      * LOOKUP TABLE: Distance (Meters) -> Shooter Speed % (0.0 to 1.0)
+     *
+     * Distance is from the ROBOT CENTER to the HUB CENTER (from the robot's field position),
+     * shown on the dashboard as AutoShooter/Distance. From our ALLIANCE ZONE that's roughly
+     * 1.1 m (touching the HUB) to 4.6 m (back at the zone line).
      *
      * This table tells the robot "if you're X meters away, shoot at Y% power."
      * If the robot is at a distance between two entries, it figures out the
@@ -259,6 +302,24 @@ public final class Constants {
      * settings page (you can open it in a browser). The default name is "limelight".
      */
     public static final String kLimelightName = "limelight";
+
+    /** Reject vision poses from a single tag farther than this (m). */
+    public static final double kMaxSingleTagDistance = 4.0;
+
+    /** Reject vision poses when the average tag distance is farther than this (m). */
+    public static final double kMaxTagDistance = 6.0;
+
+    /** Reject vision while turning faster than this (deg/s); camera latency makes it unreliable. */
+    public static final double kMaxVisionYawRateDegPerSec = 360.0;
+
+    /** Vision x/y standard deviation = kXYStdBase * (1 + dist^2) / tagCount. Higher = trust vision less. */
+    public static final double kXYStdBase = 0.1;
+
+    /** Vision heading std dev with one tag. Huge so the pose estimator trusts the gyro for heading. */
+    public static final double kThetaStd = 1.0e6;
+
+    /** Vision heading std dev (rad) with 2+ tags: lets vision slowly fix a wrong heading. */
+    public static final double kThetaStdMultiTag = 0.7;
   }
 
   /**
@@ -482,6 +543,20 @@ public final class Constants {
 
     /** Drive motor P value. Higher = reaches target speed faster but might overshoot. */
     public static final double kPDrive = .21;
+
+    /**
+     * Drive feedforward: duty cycle per m/s. 1 / (NEO free speed in m/s at the wheel).
+     * Without this the P-only controller settles at roughly half the commanded speed.
+     */
+    public static final double kVDrive =
+        1.0 / (ShooterConstants.kFreeSpeedRPM / 60.0 * drivePositionConversionFactor);
+
+    /** Robot center to the outside of the BUMPERS (m). Matches PathPlanner robotLength 0.9 m. */
+    public static final double kRobotHalfLength = 0.45;
+
+    /** Current limits (Amps) for the swerve motors, to avoid brownouts. */
+    public static final int driveCurrentLimit = 40;
+    public static final int rotationCurrentLimit = 25;
     /** Drive motor I value. Leave at 0 -- we don't need it. */
     public static final double kIDrive = 0.0;
     /** Drive motor D value. Leave at 0 for driving. */

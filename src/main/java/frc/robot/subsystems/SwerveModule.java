@@ -14,7 +14,6 @@ import com.revrobotics.spark.SparkLowLevel.MotorType;
 import edu.wpi.first.math.controller.PIDController;
 import edu.wpi.first.math.geometry.Rotation2d;
 import edu.wpi.first.math.kinematics.SwerveModuleState;
-import edu.wpi.first.wpilibj2.command.SubsystemBase;
 import frc.robot.Constants.*;
 
 /**
@@ -45,7 +44,7 @@ import frc.robot.Constants.*;
  * WANT TO CHANGE steering behavior? Adjust kPRotation, kDRotation in DrivetrainConstants.
  * WANT TO CHANGE drive behavior? Adjust kPDrive in DrivetrainConstants.
  */
-public class SwerveModule extends SubsystemBase {
+public class SwerveModule {
     /** SparkMax controller for the drive (forward/backward) motor. */
     private final SparkMax driveMotor;
 
@@ -99,13 +98,15 @@ public class SwerveModule extends SubsystemBase {
                       isDriveInverted,
                       IdleMode.kBrake,
                       DrivetrainConstants.drivePositionConversionFactor,
-                      DrivetrainConstants.driveVelocityConversionFactor
+                      DrivetrainConstants.driveVelocityConversionFactor,
+                      DrivetrainConstants.driveCurrentLimit
       );
       configureMotor(rotationMotor,
                       isDriveInverted,
                       IdleMode.kBrake,
                       DrivetrainConstants.rotationPositionConversionFactor,
-                      DrivetrainConstants.rotationVelocityConversionFactor
+                      DrivetrainConstants.rotationVelocityConversionFactor,
+                      DrivetrainConstants.rotationCurrentLimit
       );
 
       // Clear any fault flags from previous runs
@@ -145,18 +146,22 @@ public class SwerveModule extends SubsystemBase {
      * @param idleMode               kBrake (resist motion) or kCoast (free spin) when not powered
      * @param positionConversionFactor  multiplier to convert motor rotations to real units
      * @param velocityConversionFactor  multiplier to convert motor RPM to real units/sec
+     * @param currentLimit           max motor current in Amps (prevents brownouts)
      */
     public void configureMotor(
       SparkMax motorController,
       boolean isInverted,
       IdleMode idleMode,
       double positionConversionFactor,
-      double velocityConversionFactor
+      double velocityConversionFactor,
+      int currentLimit
     ) {
         SparkMaxConfig config = new SparkMaxConfig();
         config
           .inverted(isInverted)
-          .idleMode(idleMode);
+          .idleMode(idleMode)
+          .smartCurrentLimit(currentLimit)
+          .voltageCompensation(ShooterConstants.kNominalVoltage);
         config.encoder
           .positionConversionFactor(positionConversionFactor)
           .velocityConversionFactor(velocityConversionFactor);
@@ -200,35 +205,20 @@ public class SwerveModule extends SubsystemBase {
         return;
       }
 
+      // Take the shortest steer (never more than 90 degrees, reversing the wheel if needed),
+      // and slow the wheel while it is still pointing the wrong way.
+      Rotation2d currentAngle = new Rotation2d(getCANCoderRad());
+      SwerveModuleState optimized = new SwerveModuleState(state.speedMetersPerSecond, state.angle);
+      optimized.optimize(currentAngle);
+      optimized.cosineScale(currentAngle);
+
       // Use PID to steer the wheel to the target angle
-      rotationMotor.set(rotationPIDController.calculate(getCANCoderRad(), state.angle.getRadians()));
+      rotationMotor.set(rotationPIDController.calculate(getCANCoderRad(), optimized.angle.getRadians()));
 
-      // Use PID to drive the wheel at the target speed
-      driveMotor.set(drivePIDController.calculate(getDriveVelocity(), state.speedMetersPerSecond));
-    }
-
-    /**
-     * Optimization function that prevents the wheel from rotating more than 90 degrees.
-     *
-     * If the target angle is more than 90 degrees away from the current angle, it's faster
-     * to reverse the drive motor and rotate only 180-delta degrees. For example, instead of
-     * turning the wheel 170 degrees and driving forward, we turn it 10 degrees and drive backward.
-     *
-     * NOTE: This is currently not used (commented out in setState) because WPILib's built-in
-     * optimization may already handle this. Uncomment in setState if needed.
-     *
-     * @param desiredState  the target state
-     * @param currentAngle  the wheel's current angle
-     * @return the optimized state (possibly with reversed speed and adjusted angle)
-     */
-    public static SwerveModuleState optimize(SwerveModuleState desiredState, Rotation2d currentAngle){
-      var delta = desiredState.angle.minus(currentAngle);
-      if (Math.abs(delta.getDegrees()) > 90){
-        return new SwerveModuleState(-desiredState.speedMetersPerSecond, desiredState.angle.rotateBy(Rotation2d.kPi));
-      }
-      else{
-        return new SwerveModuleState(desiredState.speedMetersPerSecond, desiredState.angle);
-      }
+      // Feedforward does most of the work (duty cycle proportional to speed); PID trims the error.
+      driveMotor.set(
+          DrivetrainConstants.kVDrive * optimized.speedMetersPerSecond
+          + drivePIDController.calculate(getDriveVelocity(), optimized.speedMetersPerSecond));
     }
 
     /**
@@ -323,8 +313,4 @@ public class SwerveModule extends SubsystemBase {
       return getCANCoderRad();
     }
 
-    @Override
-    public void periodic() {
-      // This method will be called once per scheduler run
-    }
 }

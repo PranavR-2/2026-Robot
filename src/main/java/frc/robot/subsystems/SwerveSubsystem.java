@@ -10,11 +10,18 @@ import edu.wpi.first.wpilibj.DriverStation;
 import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
 import frc.robot.Constants.DrivetrainConstants;
 import frc.robot.Constants.VisionConstants;
+import frc.robot.FieldConstants;
 
 import edu.wpi.first.cscore.HttpCamera;
 import edu.wpi.first.wpilibj.shuffleboard.BuiltInWidgets;
 import edu.wpi.first.wpilibj.shuffleboard.Shuffleboard;
+import edu.wpi.first.wpilibj.Alert;
+import edu.wpi.first.wpilibj.Alert.AlertType;
 import edu.wpi.first.wpilibj.Timer;
+import edu.wpi.first.math.VecBuilder;
+import edu.wpi.first.networktables.BooleanSubscriber;
+import edu.wpi.first.networktables.DoubleArraySubscriber;
+import edu.wpi.first.networktables.DoubleSubscriber;
 import edu.wpi.first.networktables.NetworkTable;
 import edu.wpi.first.networktables.NetworkTableInstance;
 import com.pathplanner.lib.auto.AutoBuilder;
@@ -117,6 +124,28 @@ public class SwerveSubsystem extends SubsystemBase{
     /** Connection to the Limelight (our vision camera). We read all target data through this. */
     private final NetworkTable limelightTable;
 
+    // Subscribers are created once; looking up entries by name every call is slower.
+    private final DoubleSubscriber tvSub;
+    private final DoubleSubscriber txSub;
+    private final DoubleSubscriber tidSub;
+    private final DoubleArraySubscriber botposeSub;
+    private final DoubleArraySubscriber targetposeSub;
+
+    /** Limelight heartbeat: increments every processed frame. Used to detect a dead camera. */
+    private final DoubleSubscriber heartbeatSub;
+    private double lastHeartbeat = -1;
+    private double lastHeartbeatTime = 0;
+
+    private final Alert navXAlert = new Alert("NavX disconnected: field-relative driving and odometry won't work", AlertType.kError);
+    private final Alert limelightAlert = new Alert("Limelight not updating: no vision pose or auto-aim distance correction", AlertType.kWarning);
+
+    /** Dashboard "Debug Swerve" toggle. Per-module telemetry is only published while it's on. */
+    private final BooleanSubscriber debugSub = NetworkTableInstance.getDefault()
+        .getTable("SmartDashboard").getBooleanTopic("Debug Swerve").subscribe(false);
+
+    /** Gyro is re-zeroed once, after it has had time to boot, while the robot is still disabled. */
+    private boolean gyroZeroed = false;
+    private final double constructedTime = Timer.getFPGATimestamp();
 
 
     /**
@@ -129,17 +158,8 @@ public class SwerveSubsystem extends SubsystemBase{
     public SwerveSubsystem(){
         navX = new AHRS(AHRS.NavXComType.kMXP_SPI);
 
-        // Delay NavX reset by 1 second to allow it to finish booting up.
-        // The NavX needs time to calibrate its internal sensors after power-on.
-        new Thread(() -> {
-            try{
-                Thread.sleep(1000);
-                navX.reset();
-            }
-            catch(Exception e){
-                e.printStackTrace();
-            }
-        }).start();
+        // The NavX needs about a second to boot after power-on, so it is zeroed from
+        // periodic() once that time has passed (see zeroGyroAfterBoot).
 
         // Sync up the motor encoders with the CANcoders.
         // CANcoders always know the real wheel angle (even after a reboot), but the
@@ -159,6 +179,16 @@ public class SwerveSubsystem extends SubsystemBase{
         // --- Limelight Setup ---
         // Connect to the Limelight (our vision camera) so we can read what it sees.
         limelightTable = NetworkTableInstance.getDefault().getTable(VisionConstants.kLimelightName);
+        tvSub = limelightTable.getDoubleTopic("tv").subscribe(0.0);
+        txSub = limelightTable.getDoubleTopic("tx").subscribe(0.0);
+        tidSub = limelightTable.getDoubleTopic("tid").subscribe(-1.0);
+        botposeSub = limelightTable.getDoubleArrayTopic("botpose_wpiblue").subscribe(new double[0]);
+        targetposeSub = limelightTable.getDoubleArrayTopic("targetpose_cameraspace").subscribe(new double[0]);
+        heartbeatSub = limelightTable.getDoubleTopic("hb").subscribe(-1.0);
+
+        // AprilTag tracking doesn't need the Limelight's bright LEDs. Keep them off
+        // (rule R203-L: high intensity lights only briefly while targeting).
+        limelightTable.getEntry("ledMode").setNumber(1);
 
         // Add the Limelight camera stream to the Shuffleboard "Driver" tab
         // so the drive team can see what the camera sees.
@@ -279,6 +309,37 @@ public class SwerveSubsystem extends SubsystemBase{
     }
 
     /**
+     * Zeroes the gyro AND the pose estimator's heading together, keeping the robot's
+     * field position. Use this instead of resetHeading() so odometry and gyro agree.
+     *
+     * Assumes the robot is facing straight away from our DRIVER STATION. The gyro becomes 0
+     * (so field-relative driving is "away from the driver" for both alliances), but the
+     * field pose heading is set to the real field direction: 0 on blue (facing +X) and
+     * 180 degrees on red (facing -X). Auto-aim and the ALLIANCE ZONE check rely on that.
+     */
+    public void zeroHeading(){
+        navX.reset();
+        boolean isRed = DriverStation.getAlliance().orElse(DriverStation.Alliance.Blue)
+            == DriverStation.Alliance.Red;
+        poseEstimator.resetPosition(
+            getHeading(),
+            getModulePositions(),
+            new Pose2d(getPose().getTranslation(), isRed ? Rotation2d.kPi : Rotation2d.kZero));
+    }
+
+    /**
+     * One-time gyro zero after the NavX has booted, only while disabled so it can't jolt a
+     * running robot, and only once the Driver Station has told us our alliance (needed to
+     * set the field heading correctly on red).
+     */
+    private void zeroGyroAfterBoot(){
+        if (gyroZeroed || !DriverStation.isDisabled() || DriverStation.getAlliance().isEmpty()) return;
+        if (Timer.getFPGATimestamp() - constructedTime < 1.0) return;
+        zeroHeading();
+        gyroZeroed = true;
+    }
+
+    /**
      * Tells the robot "you are HERE on the field." Used at the start of auto
      * so the robot knows its starting position.
      */
@@ -297,10 +358,12 @@ public class SwerveSubsystem extends SubsystemBase{
         backRight.setState(desiredStates[3]);
 
         // Log the commanded angles for debugging
-        SmartDashboard.putNumber("FL Set Position", desiredStates[0].angle.getRadians());
-        SmartDashboard.putNumber("FR Set Position", desiredStates[1].angle.getRadians());
-        SmartDashboard.putNumber("BL Set Position", desiredStates[2].angle.getRadians());
-        SmartDashboard.putNumber("BR Set Position", desiredStates[3].angle.getRadians());
+        if (debugSub.get()) {
+            SmartDashboard.putNumber("FL Set Position", desiredStates[0].angle.getRadians());
+            SmartDashboard.putNumber("FR Set Position", desiredStates[1].angle.getRadians());
+            SmartDashboard.putNumber("BL Set Position", desiredStates[2].angle.getRadians());
+            SmartDashboard.putNumber("BR Set Position", desiredStates[3].angle.getRadians());
+        }
     }
 
     /**
@@ -373,10 +436,12 @@ public class SwerveSubsystem extends SubsystemBase{
         setModuleStates(states);
 
         // Log commanded speeds for debugging
-        SmartDashboard.putNumber("FL Set Speed", states[0].speedMetersPerSecond);
-        SmartDashboard.putNumber("FR Set Speed", states[1].speedMetersPerSecond);
-        SmartDashboard.putNumber("BL Set Speed", states[2].speedMetersPerSecond);
-        SmartDashboard.putNumber("BR Set Speed", states[3].speedMetersPerSecond);
+        if (debugSub.get()) {
+            SmartDashboard.putNumber("FL Set Speed", states[0].speedMetersPerSecond);
+            SmartDashboard.putNumber("FR Set Speed", states[1].speedMetersPerSecond);
+            SmartDashboard.putNumber("BL Set Speed", states[2].speedMetersPerSecond);
+            SmartDashboard.putNumber("BR Set Speed", states[3].speedMetersPerSecond);
+        }
     }
 
     /**
@@ -386,6 +451,9 @@ public class SwerveSubsystem extends SubsystemBase{
     @Override
     public void periodic(){
         super.periodic();
+
+        zeroGyroAfterBoot();
+        updateAlerts();
 
         // Update position using wheel + gyro data (good but drifts over time)
         poseEstimator.update(getHeading(), getModulePositions());
@@ -414,9 +482,9 @@ public class SwerveSubsystem extends SubsystemBase{
      */
     private void updateVisionPose() {
         // tv = "target valid" -- 1.0 means the Limelight sees an AprilTag
-        if (limelightTable.getEntry("tv").getDouble(0) != 1.0) return;
+        if (tvSub.get() != 1.0) return;
 
-        double[] botpose = limelightTable.getEntry("botpose_wpiblue").getDoubleArray(new double[7]);
+        double[] botpose = botposeSub.get();
         if (botpose.length < 7) return;
 
         // Make sure the data isn't garbage (sometimes the Limelight sends bad data)
@@ -424,14 +492,47 @@ public class SwerveSubsystem extends SubsystemBase{
             if (Double.isNaN(v) || Double.isInfinite(v)) return;
         }
 
+        // MegaTag1 array: [x,y,z,roll,pitch,yaw,latency_ms,tagCount,tagSpan,avgTagDist,avgTagArea]
+        int tagCount = botpose.length > 7 ? (int) botpose[7] : 1;
+        double avgDist = botpose.length > 9 ? botpose[9] : 0.0;
+        if (tagCount < 1) return;
+
+        // Reject poses that are likely wrong: off the field, too far from the tags, or
+        // captured while spinning fast (camera latency makes the heading unreliable).
+        if (botpose[0] < 0 || botpose[0] > FieldConstants.kFieldLength
+            || botpose[1] < 0 || botpose[1] > FieldConstants.kFieldWidth) return;
+        if (avgDist > VisionConstants.kMaxTagDistance) return;
+        if (tagCount == 1 && avgDist > VisionConstants.kMaxSingleTagDistance) return;
+        if (Math.abs(navX.getRate()) > VisionConstants.kMaxVisionYawRateDegPerSec) return;
+
         // Create a Pose2d from the vision data (x, y, yaw)
         Pose2d visionPose = new Pose2d(botpose[0], botpose[1], Rotation2d.fromDegrees(botpose[5]));
 
         // Account for the Limelight's delay -- the picture was taken a few ms ago
         double timestamp = Timer.getFPGATimestamp() - (botpose[6] / 1000.0);
 
+        // Trust vision less the farther away the tags are and the fewer we see. Single-tag
+        // heading is noisy, so it's left to the gyro; with 2+ tags vision heading is good
+        // enough to slowly correct a wrong field heading (e.g. gyro zeroed facing the wrong way).
+        double xyStd = VisionConstants.kXYStdBase * (1.0 + avgDist * avgDist) / tagCount;
+        double thetaStd = tagCount >= 2 ? VisionConstants.kThetaStdMultiTag : VisionConstants.kThetaStd;
+
         // Feed the vision measurement into the pose estimator
-        poseEstimator.addVisionMeasurement(visionPose, timestamp);
+        poseEstimator.addVisionMeasurement(
+            visionPose, timestamp, VecBuilder.fill(xyStd, xyStd, thetaStd));
+    }
+
+    /** Flags hardware problems on the dashboard so the pit crew sees them before a match. */
+    private void updateAlerts() {
+        navXAlert.set(!navX.isConnected());
+
+        double now = Timer.getFPGATimestamp();
+        double hb = heartbeatSub.get();
+        if (hb != lastHeartbeat) {
+            lastHeartbeat = hb;
+            lastHeartbeatTime = now;
+        }
+        limelightAlert.set(now - lastHeartbeatTime > 1.0);
     }
 
     /**
@@ -440,7 +541,7 @@ public class SwerveSubsystem extends SubsystemBase{
      * @return true if a target is visible
      */
     public boolean getLimelightHasTarget() {
-        return limelightTable.getEntry("tv").getDouble(0) == 1.0;
+        return tvSub.get() == 1.0;
     }
 
     /**
@@ -449,7 +550,7 @@ public class SwerveSubsystem extends SubsystemBase{
      * The AlignToTag command uses this to auto-rotate toward the target.
      */
     public double getLimelightTx() {
-        return limelightTable.getEntry("tx").getDouble(0);
+        return txSub.get();
     }
 
     /**
@@ -457,7 +558,7 @@ public class SwerveSubsystem extends SubsystemBase{
      * The auto-shooter uses this to make sure we're aiming at our own alliance's goal.
      */
     public int getLimelightTid() {
-        return (int) limelightTable.getEntry("tid").getDouble(-1);
+        return (int) tidSub.get();
     }
 
     /**
@@ -465,8 +566,7 @@ public class SwerveSubsystem extends SubsystemBase{
      * to calculate the straight-line distance. Returns -1.0 if no target is visible.
      */
     public double getLimelightTargetDistanceMeters() {
-        double[] targetpose = limelightTable.getEntry("targetpose_cameraspace")
-            .getDoubleArray(new double[0]);
+        double[] targetpose = targetposeSub.get();
         if (targetpose.length < 3) return -1.0;
         return Math.sqrt(targetpose[0] * targetpose[0]
             + targetpose[1] * targetpose[1]
@@ -478,6 +578,11 @@ public class SwerveSubsystem extends SubsystemBase{
      * Called every 20ms from periodic().
      */
     protected void execute() {
+        SmartDashboard.putBoolean("Field Realtive", fieldRelativeStatus);
+
+        // Detailed per-module telemetry is only published when "Debug Swerve" is on.
+        if (!debugSub.get()) return;
+
         // Drive encoder velocities (m/s)
         SmartDashboard.putNumber("FL Drive Encoder", frontLeft.getDriveVelocity());
         SmartDashboard.putNumber("FR Drive Encoder", frontRight.getDriveVelocity());
@@ -492,8 +597,5 @@ public class SwerveSubsystem extends SubsystemBase{
 
         // NavX heading (degrees)
         SmartDashboard.putNumber("Yaw", -navX.getYaw());
-
-        // Current field-relativity status
-        SmartDashboard.putBoolean("Field Realtive", fieldRelativeStatus);
     }
 }

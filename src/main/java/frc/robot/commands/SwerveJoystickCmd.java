@@ -3,6 +3,7 @@ package frc.robot.commands;
 import java.util.function.DoubleSupplier;
 
 
+import edu.wpi.first.math.MathUtil;
 import edu.wpi.first.math.filter.SlewRateLimiter;
 import edu.wpi.first.wpilibj2.command.Command;
 import frc.robot.Constants.DrivetrainConstants;
@@ -66,17 +67,24 @@ public class SwerveJoystickCmd extends Command {
         this.slider = slider;
 
         // These limit how fast the speed can change (prevents jerky movement).
-        xLimiter = new SlewRateLimiter(DrivetrainConstants.maxAcceleration);
-        yLimiter = new SlewRateLimiter(DrivetrainConstants.maxAcceleration);
-        rLimiter = new SlewRateLimiter(DrivetrainConstants.maxAngularAcceleration);
+        // The limiters work on the normalized (-1 to 1) stick value, so convert the
+        // real-unit limits (m/s^2, rad/s^2) into "fraction of full speed per second".
+        xLimiter = new SlewRateLimiter(DrivetrainConstants.maxAcceleration / DrivetrainConstants.maxVelocity);
+        yLimiter = new SlewRateLimiter(DrivetrainConstants.maxAcceleration / DrivetrainConstants.maxVelocity);
+        rLimiter = new SlewRateLimiter(DrivetrainConstants.maxAngularAcceleration / DrivetrainConstants.maxAngularVelocity);
 
         // Tell the scheduler that this command uses the drivetrain.
         // This prevents other commands from using the drivetrain at the same time.
         addRequirements(swerveSubsystem);
     }
 
+    /** Start smoothing from standstill so stale limiter values don't cause a lurch. */
     @Override
-    public void initialize(){}
+    public void initialize(){
+        xLimiter.reset(0);
+        yLimiter.reset(0);
+        rLimiter.reset(0);
+    }
 
     /**
      * Called every 20ms. Reads joystick values, applies deadband + slew rate limiting,
@@ -123,8 +131,16 @@ public class SwerveJoystickCmd extends Command {
         SlewRateLimiter limiter,
         double maxSpeed
     ) {
-        value = Math.abs(value) < deadband ? 0 : value;
-        return limiter.calculate(value)*maxSpeed;
+        return limiter.calculate(shapeInput(value, deadband))*maxSpeed;
+    }
+
+    /**
+     * Deadband that rescales the remaining range (so there's no jump when the stick leaves
+     * the deadband), then squares the value (keeping sign) for finer control at low speeds.
+     */
+    public static double shapeInput(double value, double deadband) {
+        double v = MathUtil.applyDeadband(value, deadband);
+        return Math.copySign(v * v, v);
     }
 
     @Override

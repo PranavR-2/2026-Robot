@@ -5,34 +5,41 @@ import frc.robot.Constants.ShooterConstants;
 import frc.robot.Constants.OperatorConstants;
 import frc.robot.Constants.ClimbConstants;
 
-import frc.robot.commands.ExampleCommand;
-import frc.robot.commands.FlipFieldRelativity;
-import frc.robot.commands.FlipFieldRelativity2;
 import frc.robot.commands.Intake;
 import frc.robot.commands.Climb;
 import frc.robot.commands.ClimbDown;
 import frc.robot.commands.Outtake;
-import frc.robot.commands.ResetNavX;
 import frc.robot.commands.Shooter;
 import frc.robot.commands.SwerveJoystickCmd;
 import frc.robot.subsystems.IntakeMechanism;
 import frc.robot.subsystems.ShooterMechanism;
 import frc.robot.commands.AlignToTag;
 import frc.robot.subsystems.ClimbMechanism;
-import frc.robot.subsystems.ExampleSubsystem;
 import frc.robot.subsystems.SwerveSubsystem;
 import frc.robot.commands.AutoShooter;
 import frc.robot.commands.AlignAndShoot;
+import frc.robot.util.HubShift;
+
+import java.util.Map;
+import java.util.Set;
 
 import com.pathplanner.lib.auto.AutoBuilder;
 import com.pathplanner.lib.auto.NamedCommands;
 
+import edu.wpi.first.math.filter.Debouncer;
+import edu.wpi.first.math.filter.Debouncer.DebounceType;
+import edu.wpi.first.wpilibj.Alert;
+import edu.wpi.first.wpilibj.Alert.AlertType;
+import edu.wpi.first.wpilibj.DriverStation;
+import edu.wpi.first.wpilibj.GenericHID.RumbleType;
+import edu.wpi.first.wpilibj.RobotController;
 import edu.wpi.first.wpilibj.shuffleboard.BuiltInWidgets;
 import edu.wpi.first.wpilibj.shuffleboard.Shuffleboard;
 import edu.wpi.first.wpilibj.smartdashboard.SendableChooser;
 import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
 import edu.wpi.first.networktables.GenericEntry;
 import edu.wpi.first.wpilibj2.command.Command;
+import edu.wpi.first.wpilibj2.command.Commands;
 import edu.wpi.first.wpilibj2.command.button.CommandXboxController;
 import edu.wpi.first.wpilibj2.command.button.Trigger;
 
@@ -60,8 +67,6 @@ public class RobotContainer {
   // ========================
   // Each subsystem represents a physical mechanism on the robot.
   // We create them here so they exist for the entire match.
-
-  private final ExampleSubsystem m_exampleSubsystem = new ExampleSubsystem();
 
   /** The swerve drivetrain -- controls all 4 swerve modules and handles odometry/vision. */
   private final SwerveSubsystem m_drivetrain = new SwerveSubsystem();
@@ -108,6 +113,23 @@ public class RobotContainer {
    * Sets up the default drive command, binds buttons, registers auto commands,
    * and configures the dashboard.
    */
+  /**
+   * Every command name PathPlanner autos may use. A unit test (AutoPathRulesTest) checks
+   * that each .auto file only uses these, so an auto can't silently skip a missing command.
+   */
+  public static final Set<String> NAMED_COMMANDS = Set.of(
+      "Intake", "Outtake", "Shoot", "AutoShoot", "AlignToTag", "AlignAndShoot", "Climb");
+
+  /**
+   * Warns when the battery is low. Checked only while DISABLED (resting voltage) because
+   * under swerve load any battery dips below 12V during a match.
+   */
+  private final Debouncer lowBatteryDebouncer = new Debouncer(2.0, DebounceType.kRising);
+  private final Alert lowBatteryAlert = new Alert("Battery below 12.0V at rest -- swap before the next match", AlertType.kWarning);
+
+  /** Warns when the FMS HUB-shift data is missing in TELEOP (HUB gating then assumes active). */
+  private final Alert hubDataAlert = new Alert("No HUB shift data from FMS -- shooter is NOT gating on HUB status", AlertType.kWarning);
+
   public RobotContainer() {
 
     // Set the default command for the drivetrain: joystick driving.
@@ -115,8 +137,8 @@ public class RobotContainer {
     // This means the robot is always drivable unless another command takes over.
     m_drivetrain.setDefaultCommand(new SwerveJoystickCmd(
       m_drivetrain,
-      () -> m_driverController.getLeftY(),      // Forward/backward (Y-axis is inverted on controllers)
-      () -> m_driverController.getLeftX(),      // Left/right strafe
+      this::driveForward,                       // Forward/backward
+      this::driveStrafe,                        // Left/right strafe
       () -> m_driverController.getRightX(),     // Rotation
       () -> m_driverController.getLeftTriggerAxis() // Speed slider (pull trigger to slow down)
     ));
@@ -130,13 +152,18 @@ public class RobotContainer {
     // Named commands allow PathPlanner autonomous routines to trigger robot actions.
     // In a .auto file, you can add a "NamedCommand" event with one of these names
     // and the corresponding command will run at that point in the path.
-    NamedCommands.registerCommand("Intake", new Intake(m_intakeMech));
-    NamedCommands.registerCommand("Outtake", new Outtake(m_intakeMech));
-    NamedCommands.registerCommand("Shoot", new Shooter(m_shooterMech));
-    NamedCommands.registerCommand("AutoShoot", new AutoShooter(m_shooterMech, m_drivetrain));
-    NamedCommands.registerCommand("AlignToTag", new AlignToTag(m_drivetrain, () -> 0.0, () -> 0.0));
-    NamedCommands.registerCommand("AlignAndShoot", new AlignAndShoot(m_drivetrain, m_shooterMech).withTimeout(3.0));
-    NamedCommands.registerCommand("Climb", new Climb(m_climbMech));
+    Map<String, Command> namedCommands = Map.of(
+        "Intake", new Intake(m_intakeMech),
+        "Outtake", new Outtake(m_intakeMech),
+        "Shoot", new Shooter(m_shooterMech),
+        "AutoShoot", new AutoShooter(m_shooterMech, m_drivetrain),
+        "AlignToTag", new AlignToTag(m_drivetrain, () -> 0.0, () -> 0.0),
+        "AlignAndShoot", new AlignAndShoot(m_drivetrain, m_shooterMech).withTimeout(3.0),
+        "Climb", new Climb(m_climbMech));
+    namedCommands.forEach(NamedCommands::registerCommand);
+    if (!namedCommands.keySet().equals(NAMED_COMMANDS)) {
+      DriverStation.reportError("RobotContainer.NAMED_COMMANDS is out of sync with registered commands", false);
+    }
 
     // Build the auto chooser dropdown. "MobilityAuto" is the default selection.
     // PathPlanner scans the deploy/pathplanner/autos/ folder for .auto files.
@@ -181,8 +208,12 @@ public class RobotContainer {
    *   A button     = Disable field-relative driving (robot-relative)
    *   Y button     = Reset NavX gyro heading (re-zeroes "forward")
    *   B button     = Run shooter at constant speed
-   *   Left Bumper  = Auto-shooter (distance-based speed)
-   *   Right Bumper = Align to AprilTag (auto-rotation)
+   *   Left Bumper  = Aim at HUB + auto-shoot (distance-based speed; only feeds when HUB
+   *                  active, in ALLIANCE ZONE, and aimed). Driver still translates.
+   *   Right Bumper = Aim at HUB (auto-rotation)
+   *   Right Trigger (hold) = Override the auto-shooter's HUB/zone/aim checks
+   *
+   * Both controllers rumble 3 s before our HUB turns on or off, and when END GAME starts.
    *
    * OPERATOR CONTROLLER (port 1):
    *   B button     = Run intake (suck in game piece)
@@ -191,29 +222,42 @@ public class RobotContainer {
    *   Right Bumper = Climb down
    */
   private void configureBindings() {
-    // Schedule ExampleCommand when exampleCondition changes to true
-    new Trigger(m_exampleSubsystem::exampleCondition)
-        .onTrue(new ExampleCommand(m_exampleSubsystem));
-
     // --- DRIVER CONTROLLER BINDINGS ---
 
     // Field relativity controls: X = field-relative ON, A = field-relative OFF
-    m_driverController.x().whileTrue(new FlipFieldRelativity(m_drivetrain));
-    m_driverController.a().whileTrue(new FlipFieldRelativity2(m_drivetrain));
+    // These are one-shot actions with no subsystem requirement, so pressing them never
+    // interrupts driving (the old whileTrue commands required the drivetrain).
+    m_driverController.x().onTrue(Commands.runOnce(() -> m_drivetrain.setFieldRelativity(true)));
+    m_driverController.a().onTrue(Commands.runOnce(() -> m_drivetrain.setFieldRelativity(false)));
 
     // Reset the NavX gyro heading -- makes the robot's current facing direction "forward"
-    m_driverController.y().whileTrue(new ResetNavX(m_drivetrain));
+    m_driverController.y().onTrue(Commands.runOnce(m_drivetrain::zeroHeading));
 
     // Shooter: B = constant speed, Left Bumper = auto-speed based on distance
     m_driverController.b().whileTrue(new Shooter(m_shooterMech));
-    m_driverController.leftBumper().whileTrue(new AutoShooter(m_shooterMech, m_drivetrain));
+    // Left Bumper = aim AND shoot in one button: turns toward the HUB while the driver keeps
+    // translating, and feeds once aimed (AutoShooter won't feed until within the aim tolerance).
+    m_driverController.leftBumper().whileTrue(Commands.parallel(
+        new AlignToTag(m_drivetrain, this::driveForward, this::driveStrafe),
+        new AutoShooter(m_shooterMech, m_drivetrain, m_driverController.rightTrigger())));
+
+    // --- RUMBLE CUES ---
+    // 3 s warning before our HUB turns on (get ready to fire) or off (stop and collect/defend).
+    new Trigger(() -> {
+      double t = HubShift.secondsUntilChange();
+      return t > 0 && t <= 3.0;
+    }).onTrue(rumble(0.5));
+
+    // END GAME starts (0:30): both HUBS active, time to think about climbing.
+    new Trigger(() -> DriverStation.isTeleopEnabled()
+        && DriverStation.getMatchTime() > 0 && DriverStation.getMatchTime() <= 30.0)
+        .onTrue(rumble(1.0));
 
     // Align to AprilTag: auto-rotates to face the target while still allowing manual driving
+    // Uses the SAME stick inputs as normal driving so the robot doesn't feel reversed while
+    // aiming. (Previously these were negated vs. SwerveJoystickCmd -- one of them was wrong.)
     m_driverController.rightBumper().whileTrue(new AlignToTag(
-        m_drivetrain,
-        () -> -m_driverController.getLeftY(), // Forward/Back (negated because Y-axis is inverted)
-        () -> -m_driverController.getLeftX()  // Left/Right (negated for same reason)
-    ));
+        m_drivetrain, this::driveForward, this::driveStrafe));
 
     // --- OPERATOR CONTROLLER BINDINGS ---
 
@@ -232,6 +276,38 @@ public class RobotContainer {
    *
    * @return true if auto-alignment is enabled on the dashboard
    */
+  /** Driver translation inputs, shared by every command that lets the driver translate. */
+  private double driveForward() {
+    return m_driverController.getLeftY();
+  }
+
+  private double driveStrafe() {
+    return m_driverController.getLeftX();
+  }
+
+  /** Rumbles both controllers for the given time. Requires no subsystem, so it never interrupts anything. */
+  private Command rumble(double seconds) {
+    return Commands.startEnd(
+        () -> setRumble(1.0),
+        () -> setRumble(0.0))
+      .withTimeout(seconds);
+  }
+
+  private void setRumble(double value) {
+    m_driverController.getHID().setRumble(RumbleType.kBothRumble, value);
+    m_operatorController.getHID().setRumble(RumbleType.kBothRumble, value);
+  }
+
+  /** Called every loop from Robot.robotPeriodic(): dashboard status and alerts. */
+  public void periodic() {
+    HubShift.publish();
+    // Debounced so brief sags under hard acceleration don't flash the warning
+    lowBatteryAlert.set(lowBatteryDebouncer.calculate(
+        DriverStation.isDisabled() && RobotController.getBatteryVoltage() < 12.0));
+    hubDataAlert.set(DriverStation.isTeleopEnabled() && DriverStation.isFMSAttached()
+        && HubShift.redInactiveFirst().isEmpty());
+  }
+
   public boolean isAutoAlignEnabled() {
     return autoAlignEntry.getBoolean(false);
   }

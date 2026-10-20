@@ -4,39 +4,42 @@ import java.util.function.DoubleSupplier;
 
 import edu.wpi.first.math.controller.PIDController;
 import edu.wpi.first.math.filter.SlewRateLimiter;
+import edu.wpi.first.math.geometry.Translation2d;
+import edu.wpi.first.wpilibj.DriverStation;
 import edu.wpi.first.wpilibj2.command.Command;
 import frc.robot.Constants.DrivetrainConstants;
 import frc.robot.Constants.OperatorConstants;
+import frc.robot.Constants.ShooterConstants;
+import frc.robot.FieldConstants;
 import frc.robot.subsystems.SwerveSubsystem;
 
 /**
- * Automatically rotates the robot to face an AprilTag while still allowing the driver
- * to manually control translation (forward/backward and strafing).
+ * Automatically turns the robot to point the shooter at the CENTER of our HUB while the
+ * driver keeps manual control of translation (forward/backward and strafing).
  *
  * How it works:
- *   - The Limelight tells us "tx" -- how many degrees left or right the AprilTag
- *     is from the center of the camera's view.
- *   - The code automatically spins the robot to bring tx to 0 (tag centered).
- *   - The driver can still drive forward/backward and sideways with the left stick
- *     while the auto-aim handles the spinning.
+ *   - We know where the robot is on the field (odometry + Limelight) and where our HUB is
+ *     (official AprilTag layout, see FieldConstants).
+ *   - The code spins the robot so the shooter faces the HUB center.
+ *   - This keeps working when the camera loses sight of the tag, and it doesn't lock onto
+ *     the HUB's offset AprilTags (each HUB face has one centered and one offset tag).
  *
- * The PID values (P=0.04) control how aggressively the robot spins toward the target.
- * The tolerance is 1 degree -- once the tag is within 1 degree of center, we're good.
- *
- * If no target is visible, the rotation speed is set to 0 (the robot only translates).
+ * Used with AutoShooter, which only feeds once this has the robot aimed.
  *
  * Bound to: Driver controller Right Bumper (whileTrue -- aligns while held).
  *
- * WANT TO CHANGE alignment speed/accuracy? Adjust the turnPID values in this file.
- * WANT TO CHANGE the tolerance? Adjust turnPID.setTolerance().
+ * WANT TO CHANGE alignment speed? Adjust ShooterConstants.kAimP.
+ * Shooter fires out the back? Set ShooterConstants.kShooterHeadingOffsetDeg.
  */
 public class AlignToTag extends Command {
     private final SwerveSubsystem drivetrain;
     private final DoubleSupplier forwardX, forwardY;
     private final SlewRateLimiter xLimiter, yLimiter;
 
-    /** Controls how the robot spins to face the target. Tries to center the tag in the Limelight's view. */
+    /** Controls how the robot spins to face the HUB. Input is the aim error in radians. */
     private final PIDController turnPID;
+
+    private Translation2d hubCenter = FieldConstants.kBlueHubCenter;
 
     /**
      * Creates a new AlignToTag command.
@@ -55,20 +58,34 @@ public class AlignToTag extends Command {
         this.forwardY = forwardY;
 
         // Smooth out the manual driving inputs so movement isn't jerky
-        this.xLimiter = new SlewRateLimiter(DrivetrainConstants.maxAcceleration);
-        this.yLimiter = new SlewRateLimiter(DrivetrainConstants.maxAcceleration);
+        this.xLimiter = new SlewRateLimiter(DrivetrainConstants.maxAcceleration / DrivetrainConstants.maxVelocity);
+        this.yLimiter = new SlewRateLimiter(DrivetrainConstants.maxAcceleration / DrivetrainConstants.maxVelocity);
 
-        // Controls how the robot spins to face the tag.
-        // 0.04 works well for our setup. Higher = spins faster, lower = gentler.
-        this.turnPID = new PIDController(0.04, 0, 0);
-        this.turnPID.setTolerance(1.0); // Consider "aligned" when within 1 degree
+        // Controls how the robot spins to face the HUB. Higher P = spins faster.
+        this.turnPID = new PIDController(ShooterConstants.kAimP, 0, 0);
 
         addRequirements(drivetrain);
     }
 
+    @Override
+    public void initialize() {
+        xLimiter.reset(0);
+        yLimiter.reset(0);
+        turnPID.reset();
+        var alliance = DriverStation.getAlliance();
+        hubCenter = FieldConstants.hubCenter(
+            alliance.isPresent() && alliance.get() == DriverStation.Alliance.Red);
+    }
+
+    /** Stop spinning/driving when alignment ends so the wheels aren't left at the last command. */
+    @Override
+    public void end(boolean interrupted) {
+        drivetrain.stopModules();
+    }
+
     /**
-     * Runs every 20ms: processes manual driving inputs for translation and uses
-     * the Limelight's tx value for automatic rotation toward the AprilTag.
+     * Runs every 20ms: processes manual driving inputs for translation and turns the
+     * shooter toward the HUB center.
      */
     @Override
     public void execute() {
@@ -76,22 +93,14 @@ public class AlignToTag extends Command {
         double xSpeed = applyDeadbandAndLimiter(forwardX.getAsDouble(), OperatorConstants.xDeadband, xLimiter);
         double ySpeed = applyDeadbandAndLimiter(forwardY.getAsDouble(), OperatorConstants.yDeadband, yLimiter);
 
-        // 2. Calculate rotation speed from vision
-        double rotSpeed = 0;
+        // 2. Turn toward the HUB. Positive error = HUB is counter-clockwise from where the
+        //    shooter points, which needs a positive (counter-clockwise) spin in WPILib.
+        double aimError = AutoShooter.aimErrorRadians(drivetrain.getPose(), hubCenter);
+        double rotSpeed = -turnPID.calculate(aimError, 0);
 
-        if (drivetrain.getLimelightHasTarget()) {
-            // tx = horizontal angle offset to the target in degrees
-            // Negative tx = target is to the left, positive = to the right
-            double tx = drivetrain.getLimelightTx();
-
-            // Negate because: if the target is to the right, we need to spin right
-            // (which is negative in WPILib's coordinate system)
-            rotSpeed = -turnPID.calculate(tx, 0);
-
-            // Clamp to [-1, 1] range and scale to max angular velocity
-            rotSpeed = Math.max(-1, Math.min(1, rotSpeed));
-            rotSpeed *= DrivetrainConstants.maxAngularVelocity;
-        }
+        // Clamp to [-1, 1] range and scale to max angular velocity
+        rotSpeed = Math.max(-1, Math.min(1, rotSpeed));
+        rotSpeed *= DrivetrainConstants.maxAngularVelocity;
 
         // 3. Drive the robot: manual translation + auto-rotation, always field-relative
         drivetrain.drive(
@@ -106,7 +115,6 @@ public class AlignToTag extends Command {
      * Ignores tiny stick movements (deadband) and smooths out acceleration.
      */
     private double applyDeadbandAndLimiter(double value, double deadband, SlewRateLimiter limiter) {
-        value = Math.abs(value) < deadband ? 0 : value;
-        return limiter.calculate(value) * DrivetrainConstants.maxVelocity;
+        return limiter.calculate(SwerveJoystickCmd.shapeInput(value, deadband)) * DrivetrainConstants.maxVelocity;
     }
 }
